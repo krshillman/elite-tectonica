@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.agents
+data/
+skills-lock.json
+uv.lock
+*.db
+archive/
+CONTEXT.md
+CLAUDE.md
+
+
