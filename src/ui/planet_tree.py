@@ -4,11 +4,17 @@ planet_tree.py — Two-level QTreeWidget: System → Planet.
 Layout
 ------
   Col 0  Name        System name (bold) / Planet name
-  Col 1  FF          First Footfall checkbox (planet rows only)
-  Col 2  Bios        No of Biologicals spinbox (planet rows only)
-  Col 3  Stratum     Contains Stratum Tectonicas checkbox (planet rows only)
-  Col 4  Status      Status dropdown (planet) / summary text (system)
-  Col 5  Notes       Free-text (planet rows only)
+  Col 1  Distance    Live distance from commander (LY) / arrival dist (LS)
+  Col 2  EDSM Upd    Most recent EDSM body update date (system rows only)
+  Col 3  Traffic     EDSM ships 24h/week (system rows only)
+  Col 4  FF Chance   First-footfall likelihood tier (system rows only)
+  Col 5  FF          First Footfall checkbox (planet rows only)
+  Col 6  Bios        No of Biologicals spinbox (planet rows only)
+  Col 7  Stratum     Contains Stratum Tectonicas checkbox (planet rows only)
+  Col 8  Status      Status dropdown (planet) / summary text (system)
+  Col 9  Notes       Free-text (planet rows only)
+
+Pinned systems (📌) are excluded from Auto-Skip; toggle via context menu.
 
 Behaviour
 ---------
@@ -17,10 +23,17 @@ Behaviour
 - Right-clicking a system row offers "Copy system name" and
   "Copy & Mark In Progress" (sets all Pending → In Progress, copies name).
 - Row background is tinted by planet Status for quick visual scanning.
+- When the commander's position is known (journal logs), systems are sorted
+  closest-first using live distances computed from cached EDSM coordinates.
+  The system currently occupied is flagged with 📍.
 """
 
 from __future__ import annotations
 
+import math
+from typing import Optional
+
+import autoskip
 import db
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QFont
@@ -30,13 +43,27 @@ from .delegates import ComboBoxDelegate, ReadOnlyDelegate, SpinBoxDelegate
 
 # ── Column indices ────────────────────────────────────────────────────────────
 COL_NAME    = 0
-COL_FF      = 1
-COL_BIOS    = 2
-COL_STRATUM = 3
-COL_STATUS  = 4
-COL_NOTES   = 5
+COL_DIST    = 1
+COL_UPDATED = 2   # EDSM body-data update recency (system rows)
+COL_TRAFFIC = 3   # EDSM ships 24h/week (system rows)
+COL_CHANCE  = 4   # first-footfall likelihood tier (system rows)
+COL_FF      = 5
+COL_BIOS    = 6
+COL_STRATUM = 7
+COL_STATUS  = 8
+COL_NOTES   = 9
 
-_HEADERS = ["Name", "FF", "Bios", "Stratum", "Status", "Notes"]
+_HEADERS = ["Name", "Distance", "EDSM Upd", "Traffic", "FF Chance", "FF",
+            "Bios", "Stratum", "Status", "Notes"]
+
+# FF-chance tier → foreground colour (dark-theme friendly)
+_CHANCE_FG: dict[int, QColor] = {
+    0: QColor("#e05555"),   # Very Low  — red
+    1: QColor("#e08a3c"),   # Low       — orange
+    2: QColor("#d6c04a"),   # Moderate  — yellow
+    3: QColor("#7fca5f"),   # High      — light green
+    4: QColor("#3fdc78"),   # Very High — bright green
+}
 
 # Status → background colour (dark-theme friendly)
 _STATUS_BG: dict[str, QColor | None] = {
@@ -91,6 +118,10 @@ class PlanetTree(QTreeWidget):
         hdr = self.header()
         hdr.setStretchLastSection(True)
         hdr.setSectionResizeMode(COL_NAME,    QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(COL_DIST,    QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(COL_UPDATED, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(COL_TRAFFIC, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(COL_CHANCE,  QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(COL_FF,      QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(COL_BIOS,    QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(COL_STRATUM, QHeaderView.ResizeMode.ResizeToContents)
@@ -102,6 +133,10 @@ class PlanetTree(QTreeWidget):
         # Block editing on name + checkbox columns
         ro = ReadOnlyDelegate(self)
         self.setItemDelegateForColumn(COL_NAME,    ro)
+        self.setItemDelegateForColumn(COL_DIST,    ro)
+        self.setItemDelegateForColumn(COL_UPDATED, ro)
+        self.setItemDelegateForColumn(COL_TRAFFIC, ro)
+        self.setItemDelegateForColumn(COL_CHANCE,  ro)
         self.setItemDelegateForColumn(COL_FF,      ro)
         self.setItemDelegateForColumn(COL_STRATUM, ro)
         # Custom editors for Bios and Status
@@ -111,20 +146,108 @@ class PlanetTree(QTreeWidget):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def reload(self) -> None:
-        """Clear and re-populate top-level system rows from the database."""
+    def reload(
+        self,
+        current_pos: Optional[tuple] = None,
+        current_system: Optional[str] = None,
+    ) -> None:
+        """
+        Clear and re-populate top-level system rows from the database.
+
+        When ``current_pos`` (x, y, z in LY) is provided, systems are sorted
+        by live distance from that position — closest first — so the next
+        system to visit is always at the top. Systems without cached
+        coordinates sink to the bottom (alphabetical).
+        """
+        if current_pos is not None:
+            self._current_pos = current_pos
+        if current_system is not None:
+            self._current_system = current_system
+
         self._loading = True
         self.clear()
 
         bold = QFont()
         bold.setBold(True)
 
-        for row in db.get_all_systems():
+        rows = db.get_all_systems()
+
+        pos = getattr(self, "_current_pos", None)
+        distances: dict[str, Optional[float]] = {}
+        for row in rows:
+            if pos is not None and row["x"] is not None:
+                distances[row["system_name"]] = math.sqrt(
+                    (row["x"] - pos[0]) ** 2
+                    + (row["y"] - pos[1]) ** 2
+                    + (row["z"] - pos[2]) ** 2
+                )
+            else:
+                distances[row["system_name"]] = None
+
+        if pos is not None:
+            rows = sorted(
+                rows,
+                key=lambda r: (
+                    distances[r["system_name"]] is None,   # unknown coords last
+                    distances[r["system_name"]] or 0.0,
+                    r["system_name"],
+                ),
+            )
+
+        here = getattr(self, "_current_system", None)
+        meta_map = db.get_system_meta_map()
+
+        for row in rows:
+            name = row["system_name"]
             sys_item = QTreeWidgetItem(self)
             sys_item.setFlags(_SYSTEM_FLAGS)
             sys_item.setFont(COL_NAME, bold)
-            sys_item.setText(COL_NAME, row["system_name"])
-            sys_item.setData(COL_NAME, Qt.ItemDataRole.UserRole, row["system_name"])
+            meta = meta_map.get(name)
+            pinned = bool(meta and meta.get("pinned"))
+            label = f"📍 {name}" if name == here else name
+            if pinned:
+                label = f"📌 {label}"
+            sys_item.setText(COL_NAME, label)
+            sys_item.setData(COL_NAME, Qt.ItemDataRole.UserRole, name)
+
+            # EDSM metadata columns (system rows only)
+            if meta:
+                updated = meta.get("edsm_updated_at")
+                sys_item.setText(COL_UPDATED, (updated or "—")[:10])
+                day = meta.get("traffic_day")
+                week = meta.get("traffic_week")
+                day_s = str(day) if day is not None else "—"
+                week_s = str(week) if week is not None else "—"
+                sys_item.setText(COL_TRAFFIC, f"{day_s} / {week_s}")
+                sys_item.setToolTip(
+                    COL_TRAFFIC, "EDSM traffic: last 24 h / last 7 days"
+                )
+                tier = autoskip.ff_chance(meta)
+                if tier is not None:
+                    sys_item.setText(
+                        COL_CHANCE, autoskip.FF_CHANCE_LABELS[tier]
+                    )
+                    sys_item.setForeground(
+                        COL_CHANCE, QBrush(_CHANCE_FG[tier])
+                    )
+                tip_parts = []
+                if meta.get("first_discovered"):
+                    tip_parts.append(f"First discovered: {meta['first_discovered']}")
+                if meta.get("discovered_by"):
+                    tip_parts.append(f"Discovered by: {meta['discovered_by']}")
+                if meta.get("traffic_total") is not None:
+                    tip_parts.append(f"Traffic (all-time): {meta['traffic_total']}")
+                if tip_parts:
+                    sys_item.setToolTip(COL_NAME, "\n".join(tip_parts))
+
+            dist = distances[name]
+            if name == here:
+                sys_item.setText(COL_DIST, "HERE")
+            elif dist is not None:
+                sys_item.setText(COL_DIST, f"{dist:,.1f} ly")
+            else:
+                sys_item.setText(COL_DIST, "—" if pos is not None else "")
+
             self._set_system_summary_from_row(sys_item, row)
             # Placeholder so the expand arrow is shown before lazy-load
             ph = QTreeWidgetItem(sys_item)
@@ -160,30 +283,37 @@ class PlanetTree(QTreeWidget):
         item.setText(COL_NAME, p["name"])
         item.setData(COL_NAME, Qt.ItemDataRole.UserRole, p["id"])
 
-        # Col 1 — First Footfall
+        # Col 1 — Distance to arrival within the system (LS)
+        try:
+            arrival = p["distance_to_arrival_ls"]
+        except (IndexError, KeyError):
+            arrival = None
+        item.setText(COL_DIST, f"{arrival:,.0f} ls" if arrival is not None else "")
+
+        # Col 2 — First Footfall
         item.setCheckState(
             COL_FF,
             Qt.CheckState.Checked if p["first_footfall"] else Qt.CheckState.Unchecked,
         )
 
-        # Col 2 — No of Biologicals (integer; None → empty display, 0 in editor)
+        # Col 3 — No of Biologicals (integer; None → empty display, 0 in editor)
         bios = p["no_of_biologicals"]
         if bios is not None:
             item.setData(COL_BIOS, Qt.ItemDataRole.DisplayRole, bios)
         else:
             item.setText(COL_BIOS, "")
 
-        # Col 3 — Contains Stratum Tectonicas
+        # Col 4 — Contains Stratum Tectonicas
         item.setCheckState(
             COL_STRATUM,
             Qt.CheckState.Checked if p["contains_stratum"] else Qt.CheckState.Unchecked,
         )
 
-        # Col 4 — Status
+        # Col 5 — Status
         status = p["status"] or "Pending"
         item.setText(COL_STATUS, status)
 
-        # Col 5 — Notes
+        # Col 6 — Notes
         item.setText(COL_NOTES, p["notes"] or "")
 
         self._apply_status_bg(item, status)
@@ -293,9 +423,17 @@ class PlanetTree(QTreeWidget):
             return  # No per-planet context menu yet
 
         system_name = item.data(COL_NAME, Qt.ItemDataRole.UserRole)
+        meta = db.get_system_meta_map().get(system_name)
+        pinned = bool(meta and meta.get("pinned"))
+
         menu = QMenu(self)
         act_copy     = menu.addAction("📋  Copy system name")
         act_mark     = menu.addAction("▶   Copy & Mark In Progress")
+        menu.addSeparator()
+        act_pin      = menu.addAction(
+            "📌  Unpin (allow auto-skip)" if pinned
+            else "📌  Pin (never auto-skip)"
+        )
 
         chosen = menu.exec(self.viewport().mapToGlobal(pos))
 
@@ -308,6 +446,17 @@ class PlanetTree(QTreeWidget):
             self._reload_system_children(item)
             self._refresh_system_summary(item)
             self.statusBarUpdate.emit()
+
+        elif chosen == act_pin:
+            db.set_system_pinned(system_name, not pinned)
+            # Update the row label in place (📌 prefix)
+            here = getattr(self, "_current_system", None)
+            label = f"📍 {system_name}" if system_name == here else system_name
+            if not pinned:  # it is now pinned
+                label = f"📌 {label}"
+            self._loading = True
+            item.setText(COL_NAME, label)
+            self._loading = False
 
     def _reload_system_children(self, sys_item: QTreeWidgetItem) -> None:
         """
